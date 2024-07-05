@@ -6,7 +6,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/embedding"
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/store"
 
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -16,6 +22,8 @@ import (
 )
 
 const (
+	CacheClientContextKey    = "cacheClient"
+	EmbeddingContextKey      = "embedding"
 	CacheKeyContextKey       = "cacheKey"
 	CacheContentContextKey   = "cacheContent"
 	PartialMessageContextKey = "partialMessage"
@@ -26,7 +34,7 @@ const (
 
 func main() {
 	wrapper.SetCtx(
-		"ai-cache",
+		"cache-tianchi",
 		wrapper.ParseConfigBy(parseConfig),
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
@@ -67,24 +75,6 @@ func main() {
 //
 // @End
 
-type RedisInfo struct {
-	// @Title zh-CN redis 服务名称
-	// @Description zh-CN 带服务类型的完整 FQDN 名称，例如 my-redis.dns、redis.my-ns.svc.cluster.local
-	ServiceName string `required:"true" yaml:"serviceName" json:"serviceName"`
-	// @Title zh-CN redis 服务端口
-	// @Description zh-CN 默认值为6379
-	ServicePort int `required:"false" yaml:"servicePort" json:"servicePort"`
-	// @Title zh-CN 用户名
-	// @Description zh-CN 登陆 redis 的用户名，非必填
-	Username string `required:"false" yaml:"username" json:"username"`
-	// @Title zh-CN 密码
-	// @Description zh-CN 登陆 redis 的密码，非必填，可以只填密码
-	Password string `required:"false" yaml:"password" json:"password"`
-	// @Title zh-CN 请求超时
-	// @Description zh-CN 请求 redis 的超时时间，单位为毫秒。默认值是1000，即1秒
-	Timeout int `required:"false" yaml:"timeout" json:"timeout"`
-}
-
 type KVExtractor struct {
 	// @Title zh-CN 从请求 Body 中基于 [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) 语法提取字符串
 	RequestBody string `required:"false" yaml:"requestBody" json:"requestBody"`
@@ -95,7 +85,7 @@ type KVExtractor struct {
 type PluginConfig struct {
 	// @Title zh-CN Redis 地址信息
 	// @Description zh-CN 用于存储缓存结果的 Redis 地址
-	RedisInfo RedisInfo `required:"true" yaml:"redis" json:"redis"`
+	StoreConfig store.StoreConfig `required:"true" yaml:"cache" json:"cache"`
 	// @Title zh-CN 缓存 key 的来源
 	// @Description zh-CN 往 redis 里存时，使用的 key 的提取方式
 	CacheKeyFrom KVExtractor `required:"true" yaml:"cacheKeyFrom" json:"cacheKeyFrom"`
@@ -116,29 +106,39 @@ type PluginConfig struct {
 	CacheTTL int `required:"false" yaml:"cacheTTL" json:"cacheTTL"`
 	// @Title zh-CN Redis缓存Key的前缀
 	// @Description zh-CN 默认值是"higress-ai-cache:"
-	CacheKeyPrefix string              `required:"false" yaml:"cacheKeyPrefix" json:"cacheKeyPrefix"`
-	redisClient    wrapper.RedisClient `yaml:"-" json:"-"`
+	CacheKeyPrefix string `required:"false" yaml:"cacheKeyPrefix" json:"cacheKeyPrefix"`
+
+	IndexConfig store.Index `required:"true" yaml:"index" json:"index"`
+
+	EmbeddingProviderConfig embedding.ProviderConfig `required:"true" yaml:"provider" json:"provider"`
+
+	Threshold string `required:"false" yaml:"threshold" json:"threshold"`
 }
 
 func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
-	c.RedisInfo.ServiceName = json.Get("redis.serviceName").String()
-	if c.RedisInfo.ServiceName == "" {
-		return errors.New("redis service name must not by empty")
+	log.Debugf("init config time: %s", time.Now().Format("2006-01-02 15:04:05"))
+	c.StoreConfig.Type = json.Get("cache.type").String()
+	if c.StoreConfig.Type == "" {
+		return errors.New("cache type must not by empty")
 	}
-	c.RedisInfo.ServicePort = int(json.Get("redis.servicePort").Int())
-	if c.RedisInfo.ServicePort == 0 {
-		if strings.HasSuffix(c.RedisInfo.ServiceName, ".static") {
+	c.StoreConfig.ServiceName = json.Get("cache.serviceName").String()
+	if c.StoreConfig.ServiceName == "" {
+		return errors.New("cache service name must not by empty")
+	}
+	c.StoreConfig.ServicePort = int(json.Get("cache.servicePort").Int())
+	if c.StoreConfig.ServicePort == 0 {
+		if strings.HasSuffix(c.StoreConfig.ServiceName, ".static") {
 			// use default logic port which is 80 for static service
-			c.RedisInfo.ServicePort = 80
+			c.StoreConfig.ServicePort = 80
 		} else {
-			c.RedisInfo.ServicePort = 6379
+			return errors.New("cache service port must not by empty")
 		}
 	}
-	c.RedisInfo.Username = json.Get("redis.username").String()
-	c.RedisInfo.Password = json.Get("redis.password").String()
-	c.RedisInfo.Timeout = int(json.Get("redis.timeout").Int())
-	if c.RedisInfo.Timeout == 0 {
-		c.RedisInfo.Timeout = 1000
+	c.StoreConfig.Username = json.Get("cache.username").String()
+	c.StoreConfig.Password = json.Get("cache.password").String()
+	c.StoreConfig.Timeout = int(json.Get("cache.timeout").Int())
+	if c.StoreConfig.Timeout == 0 {
+		c.StoreConfig.Timeout = 1000
 	}
 	c.CacheKeyFrom.RequestBody = json.Get("cacheKeyFrom.requestBody").String()
 	if c.CacheKeyFrom.RequestBody == "" {
@@ -164,14 +164,45 @@ func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
 	if c.CacheKeyPrefix == "" {
 		c.CacheKeyPrefix = DefaultCacheKeyPrefix
 	}
-	c.redisClient = wrapper.NewRedisClusterClient(wrapper.FQDNCluster{
-		FQDN: c.RedisInfo.ServiceName,
-		Port: int64(c.RedisInfo.ServicePort),
-	})
-	return c.redisClient.Init(c.RedisInfo.Username, c.RedisInfo.Password, int64(c.RedisInfo.Timeout))
+
+	// embedding provider config
+	c.EmbeddingProviderConfig.Model = json.Get("provider.model").String()
+	if c.EmbeddingProviderConfig.Model == "" {
+		return errors.New("embedding model is required")
+	}
+	c.EmbeddingProviderConfig.ApiToken = json.Get("provider.apiToken").String()
+	c.EmbeddingProviderConfig.Typ = json.Get("provider.type").String()
+
+	// index config
+	c.IndexConfig.Name = json.Get("index.name").String()
+	if c.IndexConfig.Name == "" {
+		return errors.New("index name is required")
+	}
+	c.IndexConfig.DataType = json.Get("index.dataType").String()
+	if c.IndexConfig.DataType == "" {
+		c.IndexConfig.DataType = "FLOAT32"
+	}
+	c.IndexConfig.Dim = uint32(json.Get("index.dim").Int())
+	if c.IndexConfig.Dim == 0 {
+		return errors.New("index dim is required")
+	}
+	c.IndexConfig.Typ = json.Get("index.typ").String()
+	if c.IndexConfig.Typ == "" {
+		c.IndexConfig.Typ = "FLAT"
+	}
+	c.IndexConfig.DistanceMethod = json.Get("index.distanceMethod").String()
+	if c.IndexConfig.DistanceMethod == "" {
+		c.IndexConfig.DistanceMethod = "COSINE"
+	}
+
+	c.Threshold = json.Get("threshold").String()
+
+	log.Debugf("init config success")
+	return nil
 }
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig, log wrapper.Log) types.Action {
+	log.Debugf("handle request headers")
 	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
 	// The request does not have a body.
 	if contentType == "" {
@@ -193,44 +224,96 @@ func TrimQuote(source string) string {
 }
 
 func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte, log wrapper.Log) types.Action {
+	log.Debugf("handle request body")
 	bodyJson := gjson.ParseBytes(body)
-	// TODO: It may be necessary to support stream mode determination for different LLM providers.
-	stream := false
-	if bodyJson.Get("stream").Bool() {
-		stream = true
-		ctx.SetContext(StreamContextKey, struct{}{})
-	} else if ctx.GetContext(StreamContextKey) != nil {
-		stream = true
-	}
+
+	log.Debugf("bodyJson:%s", bodyJson)
 	key := TrimQuote(bodyJson.Get(config.CacheKeyFrom.RequestBody).Raw)
 	if key == "" {
 		log.Debug("parse key from request body failed")
 		return types.ActionContinue
 	}
 	ctx.SetContext(CacheKeyContextKey, key)
-	err := config.redisClient.Get(config.CacheKeyPrefix+key, func(response resp.Value) {
-		if err := response.Error(); err != nil {
-			log.Errorf("redis get key:%s failed, err:%v", key, err)
-			proxywasm.ResumeHttpRequest()
-			return
-		}
-		if response.IsNull() {
-			log.Debugf("cache miss, key:%s", key)
-			proxywasm.ResumeHttpRequest()
-			return
-		}
-		log.Debugf("cache hit, key:%s", key)
-		ctx.SetContext(CacheKeyContextKey, nil)
-		if !stream {
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, response.String())), -1)
-		} else {
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, response.String())), -1)
-		}
-	})
+	provider, err := embedding.CreateProvider(config.EmbeddingProviderConfig, log)
 	if err != nil {
-		log.Error("redis access failed")
+		log.Errorf("create embedding provider failed, error:%v", err)
 		return types.ActionContinue
 	}
+	cache, err := store.CreateStore(config.StoreConfig)
+	ctx.SetContext(CacheClientContextKey, cache)
+	if err != nil {
+		log.Errorf("create cache store failed, error:%v", err)
+		return types.ActionContinue
+	}
+
+	afterGeyKey := func(response resp.Value) {
+		log.Debugf("afterGetKey start")
+		searchResponse, err := cache.ParseSearchResponse(response)
+		if err != nil {
+			log.Errorf("parse cache get key response failed, error:%v", err)
+			proxywasm.ResumeHttpRequest()
+		}
+		if searchResponse.Raw != key {
+			vector := store.Vector{
+				Content: ctx.GetContext(EmbeddingContextKey).([]float32),
+				Raw:     key,
+				Answer:  searchResponse.Answer,
+			}
+			_, err = cache.StoreVector(vector, config.IndexConfig.Name)
+			if err != nil {
+				log.Errorf("store request: %s vector failed, error:%v", key, err)
+			}
+		}
+		log.Debugf("searchResponse raw: %v, searchResponse answer: %v", searchResponse.Raw, searchResponse.Answer)
+		log.Debugf("return response cache value: %v", fmt.Sprintf(config.ReturnResponseTemplate, searchResponse.Answer))
+		proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, searchResponse.Answer)), -1)
+	}
+
+	// embedding search 的回调函数，判断向量距离，存储相似问题，返回相似回答
+	afterEmbeddingSearch := func(response resp.Value) {
+		log.Debugf("afterEmbeddingSearch start")
+		getKeyResponse, err := cache.ParseGetKeyResponse(response)
+		if err != nil {
+			log.Errorf("parse cache embedding search response failed, error: %v", err)
+			proxywasm.ResumeHttpRequest()
+		}
+		float, err := strconv.ParseFloat(config.Threshold, 32)
+		if err != nil {
+			log.Errorf("parse threshold failed, error:%v", err)
+			proxywasm.ResumeHttpRequest()
+		}
+		log.Debugf("key: %s, distance: %f", getKeyResponse.Key, getKeyResponse.Distance)
+		if getKeyResponse.Distance < float32(float) {
+			cache.GetKey(config.IndexConfig.Name, getKeyResponse.Key, afterGeyKey)
+		} else {
+			proxywasm.ResumeHttpRequest()
+		}
+	}
+
+	// provider embedding 的回调函数，处理响应并调用 search
+	afterEmbedding := func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+		log.Debugf("afterEmbedding start")
+		emb, err := provider.ParseEmbeddingResponse(responseBody)
+		if err != nil {
+			log.Errorf("parse embedding response failed, error:%v", err)
+			proxywasm.ResumeHttpRequest()
+		}
+		ctx.SetContext(EmbeddingContextKey, emb)
+		log.Debugf("start search vector: %s", config.IndexConfig.Name)
+		err = cache.SearchVector(config.IndexConfig.Name, 1, emb, afterEmbeddingSearch)
+		if err != nil {
+			log.Errorf("cache search question: %s failed, embedding: %v error:%v", ctx.GetContext(CacheKeyContextKey).(string), emb, err)
+			proxywasm.ResumeHttpRequest()
+		}
+	}
+
+	// provider embedding 的回调函数，向量化问题
+	err = provider.EmbeddingRequest(key, afterEmbedding)
+	if err != nil {
+		log.Errorf("request: %s embedding request failed, error:%v", key, err)
+		return types.ActionContinue
+	}
+
 	return types.ActionPause
 }
 
@@ -333,8 +416,9 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []by
 			body = chunk
 		}
 		bodyJson := gjson.ParseBytes(body)
-
+		log.Debugf("on response body:%s", body)
 		value = TrimQuote(bodyJson.Get(config.CacheValueFrom.ResponseBody).Raw)
+		log.Debugf("on response id: %s", bodyJson.Get("id").String())
 		if value == "" {
 			log.Warnf("parse value from response body failded, body:%s", body)
 			return chunk
@@ -363,9 +447,18 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []by
 			value = tempContentI.(string)
 		}
 	}
-	config.redisClient.Set(config.CacheKeyPrefix+key, value, nil)
-	if config.CacheTTL != 0 {
-		config.redisClient.Expire(config.CacheKeyPrefix+key, config.CacheTTL, nil)
+	cache := ctx.GetContext(CacheClientContextKey).(store.Store)
+
+	vec := store.Vector{
+		Content: ctx.GetContext(EmbeddingContextKey).([]float32),
+		Raw:     key,
+		Answer:  value,
+	}
+
+	log.Debugf("on response stage store vector: %v", vec)
+	_, err := cache.StoreVector(vec, config.IndexConfig.Name)
+	if err != nil {
+		log.Errorf("In response stage, store request: %s vector failed, error:%v", key, err)
 	}
 	return chunk
 }
